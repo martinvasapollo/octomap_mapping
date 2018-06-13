@@ -28,6 +28,8 @@
  */
 
 #include <octomap_server/OctomapServer.h>
+#include <random>
+#include <iostream>
 
 using namespace octomap;
 using octomap_msgs::Octomap;
@@ -68,7 +70,11 @@ OctomapServer::OctomapServer(ros::NodeHandle private_nh_)
   m_groundFilterDistance(0.04), m_groundFilterAngle(0.15), m_groundFilterPlaneDistance(0.07),
   m_compressMap(true),
   m_incrementalUpdate(false),
-  m_initConfig(true)
+  m_initConfig(true),
+  m_frame_id(0),
+  m_keyframe_id(0),
+  dist(0.06, 0.01),
+  translation(Eigen::Matrix4f::Identity(4, 4))
 {
   double probHit, probMiss, thresMin, thresMax;
 
@@ -262,7 +268,6 @@ bool OctomapServer::openFile(const std::string& filename){
 void OctomapServer::insertCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud){
   ros::WallTime startTime = ros::WallTime::now();
 
-
   //
   // ground filtering in base frame
   //
@@ -278,8 +283,8 @@ void OctomapServer::insertCloudCallback(const sensor_msgs::PointCloud2::ConstPtr
   }
 
   Eigen::Matrix4f sensorToWorld;
-  pcl_ros::transformAsMatrix(sensorToWorldTf, sensorToWorld);
 
+  pcl_ros::transformAsMatrix(sensorToWorldTf, sensorToWorld);
 
   // set up filter for height range, also removes NANs:
   pcl::PassThrough<PCLPoint> pass_x;
@@ -295,69 +300,55 @@ void OctomapServer::insertCloudCallback(const sensor_msgs::PointCloud2::ConstPtr
   PCLPointCloud pc_ground; // segmented ground plane
   PCLPointCloud pc_nonground; // everything else
 
-  if (m_filterGroundPlane){
-    tf::StampedTransform sensorToBaseTf, baseToWorldTf;
-    try{
-      m_tfListener.waitForTransform(m_baseFrameId, cloud->header.frame_id, cloud->header.stamp, ros::Duration(0.2));
-      m_tfListener.lookupTransform(m_baseFrameId, cloud->header.frame_id, cloud->header.stamp, sensorToBaseTf);
-      m_tfListener.lookupTransform(m_worldFrameId, m_baseFrameId, cloud->header.stamp, baseToWorldTf);
+  Eigen::Matrix4f sensorToWorldCorrect(sensorToWorld) ;
+  sensorToWorld = addNoise(sensorToWorld);
 
-
-    }catch(tf::TransformException& ex){
-      ROS_ERROR_STREAM( "Transform error for ground plane filter: " << ex.what() << ", quitting callback.\n"
-                        "You need to set the base_frame_id or disable filter_ground.");
-    }
-
-
-    Eigen::Matrix4f sensorToBase, baseToWorld;
-    pcl_ros::transformAsMatrix(sensorToBaseTf, sensorToBase);
-    pcl_ros::transformAsMatrix(baseToWorldTf, baseToWorld);
-
-    // transform pointcloud from sensor frame to fixed robot frame
-    pcl::transformPointCloud(pc, pc, sensorToBase);
-    pass_x.setInputCloud(pc.makeShared());
-    pass_x.filter(pc);
-    pass_y.setInputCloud(pc.makeShared());
-    pass_y.filter(pc);
-    pass_z.setInputCloud(pc.makeShared());
-    pass_z.filter(pc);
-    filterGroundPlane(pc, pc_ground, pc_nonground);
-
-    // transform clouds to world frame for insertion
-    pcl::transformPointCloud(pc_ground, pc_ground, baseToWorld);
-    pcl::transformPointCloud(pc_nonground, pc_nonground, baseToWorld);
-  } else {
-    // directly transform to map frame:
-    pcl::transformPointCloud(pc, pc, sensorToWorld);
-
-    // just filter height range:
-    pass_x.setInputCloud(pc.makeShared());
-    pass_x.filter(pc);
-    pass_y.setInputCloud(pc.makeShared());
-    pass_y.filter(pc);
-    pass_z.setInputCloud(pc.makeShared());
-    pass_z.filter(pc);
-
-    pc_nonground = pc;
-    // pc_nonground is empty without ground segmentation
-    pc_ground.header = pc.header;
-    pc_nonground.header = pc.header;
+  if(isNewKeyframe()) {
+    createOctomap(sensorToWorld);
+    m_correct_poses.push_back(sensorToWorldCorrect);
   }
 
+  ROS_INFO_STREAM("frame " << m_frame_id);
+
+  if(m_frame_id > 48) {
+    m_octrees_poses = m_correct_poses;
+    translation = Eigen::Matrix4f::Identity(4, 4);
+  }
+
+  Eigen::Matrix4f lastOctomapToWorld = m_octrees_poses.back();
+  Eigen::Matrix4f sensorToLastOctomap = lastOctomapToWorld.inverse() * sensorToWorld;
+  pcl::transformPointCloud(pc, pc, sensorToLastOctomap);
+
+  // just filter height range:
+  pass_x.setInputCloud(pc.makeShared());
+  pass_x.filter(pc);
+  pass_y.setInputCloud(pc.makeShared());
+  pass_y.filter(pc);
+  pass_z.setInputCloud(pc.makeShared());
+  pass_z.filter(pc);
+
+  pc_nonground = pc;
+  // pc_nonground is empty without ground segmentation
+  pc_ground.header = pc.header;
+  pc_nonground.header = pc.header;
 
   insertScan(sensorToWorldTf.getOrigin(), pc_ground, pc_nonground);
 
   double total_elapsed = (ros::WallTime::now() - startTime).toSec();
-  ROS_DEBUG("Pointcloud insertion in OctomapServer done (%zu+%zu pts (ground/nonground), %f sec)", pc_ground.size(), pc_nonground.size(), total_elapsed);
+    ROS_INFO("Pointcloud insertion in OctomapServer done (%zu+%zu pts (ground/nonground), %f sec)",
+          pc_ground.size(),
+          pc_nonground.size(), total_elapsed);
 
   publishAll(cloud->header.stamp);
 }
 
 void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCloud& ground, const PCLPointCloud& nonground){
-  point3d sensorOrigin = pointTfToOctomap(sensorOriginTf);
+  point3d sensorOrigin = point3d(0,0,0);
 
-  if (!m_octree->coordToKeyChecked(sensorOrigin, m_updateBBXMin)
-    || !m_octree->coordToKeyChecked(sensorOrigin, m_updateBBXMax))
+  OcTree* octree = m_octrees.back();
+
+  if (!octree->coordToKeyChecked(sensorOrigin, m_updateBBXMin)
+    || !octree->coordToKeyChecked(sensorOrigin, m_updateBBXMax))
   {
     ROS_ERROR_STREAM("Could not generate Key for origin "<<sensorOrigin);
   }
@@ -372,17 +363,17 @@ void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCl
   for (PCLPointCloud::const_iterator it = ground.begin(); it != ground.end(); ++it){
     point3d point(it->x, it->y, it->z);
     // maxrange check
-    if ((m_maxRange > 0.0) && ((point - sensorOrigin).norm() > m_maxRange) ) {
-      point = sensorOrigin + (point - sensorOrigin).normalized() * m_maxRange;
-    }
+    //if ((m_maxRange > 0.0) && ((point - sensorOrigin).norm() > m_maxRange) ) {
+    //  point = sensorOrigin + (point - sensorOrigin).normalized() * m_maxRange;
+    //}
 
     // only clear space (ground points)
-    if (m_octree->computeRayKeys(sensorOrigin, point, m_keyRay)){
-      free_cells.insert(m_keyRay.begin(), m_keyRay.end());
-    }
+    //if (octree->computeRayKeys(sensorOrigin, point, m_keyRay)){
+    //  free_cells.insert(m_keyRay.begin(), m_keyRay.end());
+    //}
 
     octomap::OcTreeKey endKey;
-    if (m_octree->coordToKeyChecked(point, endKey)){
+    if (octree->coordToKeyChecked(point, endKey)){
       updateMinKey(endKey, m_updateBBXMin);
       updateMaxKey(endKey, m_updateBBXMax);
     } else{
@@ -397,40 +388,15 @@ void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCl
     if ((m_maxRange < 0.0) || ((point - sensorOrigin).norm() <= m_maxRange) ) {
 
       // free cells
-      if (m_octree->computeRayKeys(sensorOrigin, point, m_keyRay)){
-        free_cells.insert(m_keyRay.begin(), m_keyRay.end());
-      }
+      //if (octree->computeRayKeys(sensorOrigin, point, m_keyRay)){
+      //  free_cells.insert(m_keyRay.begin(), m_keyRay.end());
+      //}
       // occupied endpoint
       OcTreeKey key;
-      if (m_octree->coordToKeyChecked(point, key)){
+      if (octree->coordToKeyChecked(point, key)){
         occupied_cells.insert(key);
-
         updateMinKey(key, m_updateBBXMin);
         updateMaxKey(key, m_updateBBXMax);
-
-#ifdef COLOR_OCTOMAP_SERVER // NB: Only read and interpret color if it's an occupied node
-        const int rgb = *reinterpret_cast<const int*>(&(it->rgb)); // TODO: there are other ways to encode color than this one
-        colors[0] = ((rgb >> 16) & 0xff);
-        colors[1] = ((rgb >> 8) & 0xff);
-        colors[2] = (rgb & 0xff);
-        m_octree->averageNodeColor(it->x, it->y, it->z, colors[0], colors[1], colors[2]);
-#endif
-      }
-    } else {// ray longer than maxrange:;
-      point3d new_end = sensorOrigin + (point - sensorOrigin).normalized() * m_maxRange;
-      if (m_octree->computeRayKeys(sensorOrigin, new_end, m_keyRay)){
-        free_cells.insert(m_keyRay.begin(), m_keyRay.end());
-
-        octomap::OcTreeKey endKey;
-        if (m_octree->coordToKeyChecked(new_end, endKey)){
-          free_cells.insert(endKey);
-          updateMinKey(endKey, m_updateBBXMin);
-          updateMaxKey(endKey, m_updateBBXMax);
-        } else{
-          ROS_ERROR_STREAM("Could not generate Key for endpoint "<<new_end);
-        }
-
-
       }
     }
   }
@@ -438,20 +404,20 @@ void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCl
   // mark free cells only if not seen occupied in this cloud
   for(KeySet::iterator it = free_cells.begin(), end=free_cells.end(); it!= end; ++it){
     if (occupied_cells.find(*it) == occupied_cells.end()){
-      m_octree->updateNode(*it, false);
+      octree->updateNode(*it, false);
     }
   }
 
   // now mark all occupied cells:
   for (KeySet::iterator it = occupied_cells.begin(), end=occupied_cells.end(); it!= end; it++) {
-    m_octree->updateNode(*it, true);
+    octree->updateNode(*it, true);
   }
 
   // TODO: eval lazy+updateInner vs. proper insertion
   // non-lazy by default (updateInnerOccupancy() too slow for large maps)
   //m_octree->updateInnerOccupancy();
   octomap::point3d minPt, maxPt;
-  ROS_DEBUG_STREAM("Bounding box keys (before): " << m_updateBBXMin[0] << " " <<m_updateBBXMin[1] << " " << m_updateBBXMin[2] << " / " <<m_updateBBXMax[0] << " "<<m_updateBBXMax[1] << " "<< m_updateBBXMax[2]);
+  //ROS_DEBUG_STREAM("Bounding box keys (before): " << m_updateBBXMin[0] << " " <<m_updateBBXMin[1] << " " << m_updateBBXMin[2] << " / " <<m_updateBBXMax[0] << " "<<m_updateBBXMax[1] << " "<< m_updateBBXMax[2]);
 
   // TODO: snap max / min keys to larger voxels by m_maxTreeDepth
 //   if (m_maxTreeDepth < 16)
@@ -466,13 +432,13 @@ void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCl
 //   }
 
   // TODO: we could also limit the bbx to be within the map bounds here (see publishing check)
-  minPt = m_octree->keyToCoord(m_updateBBXMin);
-  maxPt = m_octree->keyToCoord(m_updateBBXMax);
+  minPt = octree->keyToCoord(m_updateBBXMin);
+  maxPt = octree->keyToCoord(m_updateBBXMax);
   ROS_DEBUG_STREAM("Updated area bounding box: "<< minPt << " - "<<maxPt);
   ROS_DEBUG_STREAM("Bounding box keys (after): " << m_updateBBXMin[0] << " " <<m_updateBBXMin[1] << " " << m_updateBBXMin[2] << " / " <<m_updateBBXMax[0] << " "<<m_updateBBXMax[1] << " "<< m_updateBBXMax[2]);
 
   if (m_compressMap)
-    m_octree->prune();
+    octree->prune();
 
 #ifdef COLOR_OCTOMAP_SERVER
   if (colors)
@@ -483,10 +449,63 @@ void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCl
 #endif
 }
 
+bool OctomapServer::isNewKeyframe() {
+  bool result = false;
+  if(m_frame_id % 1 == 0) {
+    if(m_keyframe_id % 3 == 0) {
+      result = true;
+    }
+    m_keyframe_id += 1;
+  }
+  m_frame_id += 1;
+  return result;
+}
 
+OcTree* OctomapServer::createOctomap(Eigen::Matrix4f octomap_pose) {
+  ROS_INFO_STREAM("Creating octomap at " << octomap_pose);
+  OcTreeT* octree = new OcTreeT(m_res);
+  m_octrees.push_back(octree);
+  m_octrees_poses.push_back(octomap_pose);
+}
+
+OcTree* OctomapServer::mergeOctomaps(std::vector<OcTree*> m_octrees) {
+  ROS_INFO_STREAM("Mergin " << m_octrees.size() << " octomaps.");
+  OcTree* octree = new OcTreeT(m_res);
+  unsigned idx = 0;
+  for(auto it = m_octrees.begin(), end=m_octrees.end(); it!= end; ++it) {
+    Eigen::Matrix4f pose = m_octrees_poses[idx];
+    octree = mergeOctomaps(octree, *it, pose);
+    idx++;
+  }
+  return octree;
+}
+
+OcTree* OctomapServer::mergeOctomaps(OcTree* o1, OcTree* o2, Eigen::Matrix4f octo_pose) {
+  for(auto it = o2->begin(), end=o2->end(); it!= end; ++it) {
+    float logOdds = it->getLogOdds();
+    Eigen::Vector4f v = octo_pose * homogeneusVector(it.getCoordinate());
+    auto p = octomap::point3d(v.x() / v.w(), v.y() / v.w(), v.z() / v.w());
+    if(logOdds > 0.5) {
+      o1->updateNode(p, true, true);
+    }
+  }
+  return o1;
+}
+
+Eigen::Matrix4f OctomapServer::addNoise(Eigen::Matrix4f octo_pose) {
+  translation(0,3) += dist(generator);
+  translation(1,3) += dist(generator);
+  //translation(2,3) += dist(generator);
+  return translation * octo_pose;
+}
 
 void OctomapServer::publishAll(const ros::Time& rostime){
   ros::WallTime startTime = ros::WallTime::now();
+  if(m_octrees.empty()) {
+    return;
+  }
+  m_octree = mergeOctomaps(m_octrees);
+
   size_t octomapSize = m_octree->size();
   // TODO: estimate num occ. voxels for size of arrays (reserve)
   if (octomapSize <= 1){

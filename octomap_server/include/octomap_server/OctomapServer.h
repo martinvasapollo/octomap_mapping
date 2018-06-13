@@ -66,6 +66,8 @@
 #include <octomap/octomap.h>
 #include <octomap/OcTreeKey.h>
 
+#include <vector>
+
 //#define COLOR_OCTOMAP_SERVER // turned off here, turned on identical ColorOctomapServer.h - easier maintenance, only maintain OctomapServer and then copy and paste to ColorOctomapServer and change define. There are prettier ways to do this, but this works for now
 
 #ifdef COLOR_OCTOMAP_SERVER
@@ -109,7 +111,12 @@ protected:
       max[i] = std::max(in[i], max[i]);
   };
 
-  /// Test if key is within update area of map (2D, ignores height)
+  static inline Eigen::Vector4f homogeneusVector(const octomap::point3d& pose){
+    return Eigen::Vector4f(pose.x(), pose.y(), pose.z(), 1);
+  }
+
+
+        /// Test if key is within update area of map (2D, ignores height)
   inline bool isInUpdateBBX(const OcTreeT::iterator& it) const {
     // 2^(tree_depth-depth) voxels wide:
     unsigned voxelWidth = (1 << (m_maxTreeDepth - it.getDepth()));
@@ -257,7 +264,23 @@ protected:
   unsigned m_multires2DScale;
   bool m_projectCompleteMap;
   bool m_useColoredMap;
-};
+
+  std::vector<OcTreeT*> m_octrees;
+  std::vector<Eigen::Matrix4f> m_octrees_poses;
+  std::vector<Eigen::Matrix4f> m_correct_poses;
+
+  unsigned m_keyframe_id;
+  unsigned m_frame_id;
+  std::default_random_engine generator;
+  std::normal_distribution<double> dist;
+  Eigen::Matrix4f translation;
+
+  bool isNewKeyframe() ;
+  OcTreeT* createOctomap(Eigen::Matrix4f);
+  OcTreeT* mergeOctomaps(std::vector<OcTreeT*>);
+  OcTreeT* mergeOctomaps(OcTreeT* o1, OcTreeT* o2, Eigen::Matrix4f octo_pose);
+  Eigen::Matrix4f addNoise(Eigen::Matrix4f octo_pose);
+  };
 }
 
 #endif
